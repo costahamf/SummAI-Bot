@@ -36,44 +36,54 @@ except LookupError:
 # --- СЛУЖЕБНЫЕ ФУНКЦИИ ---
 
 def get_youtube_transcript(url):
-    """Извлекает субтитры из YouTube видео, включая автогенерируемые."""
+    """Извлекает субтитры из YouTube видео (русский или английский)."""
+    import re
+    from youtube_transcript_api import YouTubeTranscriptApi
+    from youtube_transcript_api._errors import NoTranscriptFound, TranscriptsDisabled
+
+    # --- 1. Извлекаем ID видео из ссылки ---
     video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})(?:[?&]|$)', url)
     video_id = video_id_match.group(1) if video_id_match else None
 
     if not video_id:
         return None, "❌ Не удалось извлечь ID видео из ссылки."
 
+    # --- 2. Пытаемся найти и получить субтитры ---
     try:
-        from youtube_transcript_api import YouTubeTranscriptApi
-        from youtube_transcript_api._errors import NoTranscriptFound, TranscriptsDisabled
-
+        # Пробуем получить список всех доступных субтитров
         transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
 
-        # Пытаемся найти подходящие субтитры: сначала русские, потом английские, потом любые
+        # Пытаемся найти русские или английские субтитры (ручные или авто)
         transcript = None
         try:
-            transcript = transcript_list.find_transcript(['ru', 'en'])
+            # Сначала ищем русские
+            transcript = transcript_list.find_transcript(['ru'])
         except NoTranscriptFound:
-            # Если нет ни русских, ни английских, пробуем взять первый доступный
             try:
+                # Если русских нет, ищем английские
+                transcript = transcript_list.find_transcript(['en'])
+            except NoTranscriptFound:
+                # Если нет ни русских, ни английских, но есть другие
+                # отдаем первый попавшийся
                 transcript = list(transcript_list)[0]
-            except:
-                pass
 
         if transcript:
-            # Если это автогенерируемые, они могут быть помечены, но всё равно работают
+            # Получаем текст субтитров с помощью .fetch()
+            # .fetch() — это современный и более надежный метод
             data = transcript.fetch()
             full_text = " ".join([entry['text'] for entry in data])
             return full_text, None
         else:
-            return None, "❌ К сожалению, для этого видео нет субтитров. Попробуйте другое видео или отправьте ссылку на статью."
+            return None, "❌ Для этого видео не найдено доступных субтитров."
+
+    # --- 3. Обрабатываем специфичные ошибки ---
     except TranscriptsDisabled:
         return None, "❌ Субтитры для этого видео отключены автором."
     except NoTranscriptFound:
-        return None, "❌ Не найдено субтитров на русском или английском языке. Попробуйте другое видео."
+        return None, "❌ Не найдено субтитров на русском или английском языке."
     except Exception as e:
-        logger.error(f"Ошибка при получении субтитров: {e}")
-        return None, f"❌ Ошибка при получении субтитров: {str(e)}"
+        print(f"Ошибка при получении субтитров: {e}")
+        return None, f"❌ Произошла техническая ошибка при обработке видео."
 
 def extract_article_text(url):
     """Извлекает заголовок и основной текст из статьи."""
