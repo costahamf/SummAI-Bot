@@ -2,267 +2,229 @@ import asyncio
 import logging
 import os
 import re
-from collections import defaultdict, deque
-from typing import Dict, List, Optional
+from io import BytesIO
 
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
-from aiogram.types import Message
-from transformers import T5ForConditionalGeneration, T5Tokenizer
-from natasha import Doc, Segmenter, NewsNERTagger, NewsEmbedding
+import language_tool_python
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+    ContextTypes,
+)
 
 # ========== НАСТРОЙКИ ==========
-# Токен теперь берется из переменной окружения (БЕЗОПАСНО!)
-API_TOKEN = os.getenv("BOT_TOKEN")
-if not API_TOKEN:
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не задан в переменных окружения")
 
-# Лимит сообщений на пользователя (можно сделать настраиваемым для каждого чата)
-DEFAULT_LIMIT = 100
-# Максимальная длина одного сообщения Telegram
-MAX_MESSAGE_LEN = 4000
+MAX_TEXT_LENGTH = 5000  # Максимальная длина текста (символов)
+MAX_MESSAGE_LEN = 4096  # Telegram лимит на одно сообщение
 
-# Настройки модели суммаризации
-MODEL_NAME = "cointegrated/rut5-base-absum"  # для слабых серверов замените на "cointegrated/rut5-small-absum"
-MAX_INPUT_TOKENS = 1024
-MAX_OUTPUT_TOKENS = 200
-
-# ========== ЛОГИРОВАНИЕ ==========
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
-# ========== ИНИЦИАЛИЗАЦИЯ МОДЕЛЕЙ ==========
-logger.info("Загрузка модели суммаризации...")
-tokenizer = T5Tokenizer.from_pretrained(MODEL_NAME, legacy=False)
-model = T5ForConditionalGeneration.from_pretrained(MODEL_NAME)
-logger.info("Модель загружена")
+# ========== ИНИЦИАЛИЗАЦИЯ LanguageTool (ОФЛАЙН/ОНЛАЙН) ==========
+# LanguageTool поддерживает русский язык и его можно использовать локально
+# Если в вашем окружении возникают проблемы, установите remote_server="https://languagetool.org/api/v2/"
+# или оставьте пустым для автоматического скачивания локальной версии.
+try:
+    tool = language_tool_python.LanguageTool("ru-RU")
+    logger.info("LanguageTool инициализирован для русского языка.")
+except Exception as e:
+    logger.error(f"Ошибка инициализации LanguageTool: {e}")
+    tool = None
 
-logger.info("Загрузка Natasha...")
-segmenter = Segmenter()
-ner_tagger = NewsNERTagger(NewsEmbedding())
-logger.info("Natasha готова")
-
-# ========== ХРАНИЛИЩЕ ==========
-# Структура: messages_store[chat_id][user_id] = deque(maxlen=limit)
-# Это позволяет разделять сообщения по разным чатам
-messages_store: Dict[int, Dict[int, deque]] = defaultdict(lambda: defaultdict(lambda: deque(maxlen=DEFAULT_LIMIT)))
-# Лимиты для каждого чата (можно расширить под каждого пользователя)
-chat_limits: Dict[int, int] = defaultdict(lambda: DEFAULT_LIMIT)
-
-# ========== ОБРАБОТЧИК ТЕКСТА ==========
-class TextProcessor:
-    @staticmethod
-    def clean_text(text: str) -> str:
-        """Удаляет ссылки, лишние пробелы, оставляет только буквы, цифры и базовую пунктуацию."""
-        text = re.sub(r'http\S+', '', text)          # удалить ссылки
-        text = re.sub(r'\s+', ' ', text)              # схлопнуть пробелы
-        text = re.sub(r'[^\w\s.,!?а-яА-Я]', '', text) # удалить спецсимволы
-        return text.strip()
-
-    @staticmethod
-    def extract_named_entities(text: str) -> str:
-        """Извлекает имена, организации, локации, даты с помощью Natasha."""
-        doc = Doc(text)
-        doc.segment(segmenter)
-        doc.tag_ner(ner_tagger)
-
-        entities = {"PER": [], "ORG": [], "LOC": [], "DATE": []}
-        for span in doc.spans:
-            if span.type in entities and span.text.strip() != "Я":
-                entities[span.type].append(span.text.strip())
-
-        result = []
-        if entities["PER"]:
-            result.append(f"👤 Персоны: {', '.join(set(entities['PER']))}")
-        if entities["ORG"]:
-            result.append(f"🏢 Организации: {', '.join(set(entities['ORG']))}")
-        if entities["LOC"]:
-            result.append(f"🌍 Локации: {', '.join(set(entities['LOC']))}")
-        if entities["DATE"]:
-            result.append(f"📅 Даты: {', '.join(set(entities['DATE']))}")
-        return "\n".join(result)
-
-    @staticmethod
-    def split_text(text: str, max_tokens: int = 500) -> List[str]:
-        """
-        Разбивает текст на части, не превышающие max_tokens токенов модели.
-        Использует прямой токенизатор для скорости.
-        """
-        tokens = tokenizer.encode(text, add_special_tokens=False)
-        chunks = []
-        for i in range(0, len(tokens), max_tokens):
-            chunk_tokens = tokens[i:i+max_tokens]
-            chunk_text = tokenizer.decode(chunk_tokens, skip_special_tokens=True)
-            chunks.append(chunk_text)
-        return chunks
-
-# ========== АСИНХРОННАЯ ГЕНЕРАЦИЯ СУММАРИЗАЦИИ ==========
-async def generate_summary(text: str) -> str:
-    """Асинхронная обертка для синхронной модели (не блокирует event loop)."""
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _sync_generate_summary, text)
-
-def _sync_generate_summary(text: str) -> str:
-    """Синхронная часть генерации."""
-    try:
-        # Токенизация
-        inputs = tokenizer(
-            text,
-            max_length=MAX_INPUT_TOKENS,
-            truncation=True,
-            padding="max_length",
-            return_tensors="pt"
-        )
-        # Генерация
-        summary_ids = model.generate(
-            inputs.input_ids,
-            max_length=MAX_OUTPUT_TOKENS,
-            min_length=50,
-            length_penalty=1.0,
-            num_beams=5,
-            repetition_penalty=1.2,
-            no_repeat_ngram_size=3,
-            temperature=0.7,
-            top_k=50,
-            top_p=0.9,
-            do_sample=True
-        )
-        return tokenizer.decode(summary_ids[0], skip_special_tokens=True)
-    except Exception as e:
-        logger.error(f"Ошибка генерации суммаризации: {e}")
-        return "Не удалось сгенерировать суммаризацию"
+# ========== КЛАВИАТУРЫ ==========
+async def start_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("📖 Помощь", callback_data="help")],
+        [InlineKeyboardButton("ℹ️ О боте", callback_data="about")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
 # ========== ОБРАБОТЧИКИ КОМАНД ==========
-@dp.message(Command("start"))
-async def cmd_start(message: Message):
-    await message.answer(
-        "🤖 Привет! Я бот для суммаризации сообщений в групповых чатах.\n\n"
-        "📌 Доступные команды:\n"
-        "/summary — получить краткую сводку по последним сообщениям (по умолчанию 100)\n"
-        "/set_limit <число> — установить лимит сообщений для этого чата\n"
-        "/stats — показать статистику по накопленным сообщениям\n"
-        "/help — это сообщение\n\n"
-        "💡 *Совет*: используйте бота в группе, он автоматически накапливает сообщения."
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start"""
+    await update.message.reply_text(
+        "👋 Привет! Я бот для проверки орфографии и грамматики.\n\n"
+        "📝 Просто отправь мне текст на русском языке, и я найду в нём ошибки.\n\n"
+        "⚡️ Работает полностью бесплатно!",
+        reply_markup=await start_keyboard(),
     )
 
-@dp.message(Command("help"))
-async def cmd_help(message: Message):
-    await cmd_start(message)  # повторно используем текст
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /help"""
+    help_text = (
+        "📖 *Как пользоваться ботом:*\n\n"
+        "1️⃣ Отправь мне любой текст на русском языке.\n"
+        "2️⃣ Я проанализирую его и найду орфографические и грамматические ошибки.\n"
+        "3️⃣ В ответе я покажу ошибки, их тип и предложу варианты исправления.\n\n"
+        "✨ *Особенности:*\n"
+        "• Поддерживаются тексты до 5000 символов.\n"
+        "• Работает полностью бесплатно и без ограничений.\n"
+        "• Не требует подписки на каналы.\n\n"
+        "🔧 Доступные команды:\n"
+        "/start - Приветственное сообщение\n"
+        "/help - Показать эту справку\n"
+        "/about - Информация о боте"
+    )
+    await update.message.reply_text(help_text, parse_mode="Markdown")
 
-@dp.message(Command("stats"))
-async def cmd_stats(message: Message):
-    chat_id = message.chat.id
-    store = messages_store.get(chat_id, {})
-    total_users = len(store)
-    total_messages = sum(len(q) for q in store.values())
-    limit = chat_limits[chat_id]
-    await message.answer(
-        f"📊 Статистика по этому чату:\n"
-        f"👥 Участников с сообщениями: {total_users}\n"
-        f"💬 Всего сообщений в памяти: {total_messages}\n"
-        f"📏 Лимит на пользователя: {limit}"
+async def cmd_about(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /about"""
+    await update.message.reply_text(
+        "ℹ️ *О боте*\n\n"
+        "Этот бот создан для проверки орфографии и грамматики текстов на русском языке.\n\n"
+        "🛠 *Технологии:*\n"
+        "• LanguageTool - мощный инструмент проверки грамматики (Open Source)\n"
+        "• Python + библиотека python-telegram-bot\n\n"
+        "📡 *Приватность:*\n"
+        "Бот не сохраняет и не передаёт ваши тексты третьим лицам.\n\n"
+        "💡 *Совет:* Для наилучшего результата отправляйте текст небольшими частями (до 1000 символов).",
+        parse_mode="Markdown"
     )
 
-@dp.message(Command("set_limit"))
-async def cmd_set_limit(message: Message):
-    chat_id = message.chat.id
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик inline-кнопок"""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "help":
+        await query.edit_message_text(
+            "📖 Отправьте мне текст на русском языке, и я найду в нём ошибки.\n\n"
+            "Поддерживаются тексты до 5000 символов.",
+            reply_markup=await start_keyboard(),
+        )
+    elif data == "about":
+        await query.edit_message_text(
+            "ℹ️ Бот использует LanguageTool — Open Source инструмент проверки грамматики.\n\n"
+            "Бот не сохраняет ваши тексты.",
+            reply_markup=await start_keyboard(),
+        )
+
+# ========== ОСНОВНАЯ ЛОГИКА ПРОВЕРКИ ==========
+def clean_text(text: str) -> str:
+    """Очищает текст от лишних пробелов и невидимых символов."""
+    # Заменяем множественные пробелы на один
+    text = re.sub(r'\s+', ' ', text)
+    # Удаляем символы управления (оставляем только печатные)
+    text = ''.join(char for char in text if ord(char) >= 32 or char in '\n\r')
+    return text.strip()
+
+async def check_text(text: str) -> str:
+    """Асинхронно проверяет текст через LanguageTool и возвращает отформатированный результат."""
+    if not tool:
+        return "❌ Ошибка: LanguageTool не инициализирован. Проверьте настройки сервера."
+
+    if len(text) > MAX_TEXT_LENGTH:
+        return f"⚠️ Текст слишком длинный ({len(text)} символов). Максимальная длина: {MAX_TEXT_LENGTH} символов."
+
+    # Очищаем текст
+    text = clean_text(text)
+    if not text:
+        return "❌ Текст не содержит значимых символов."
+
     try:
-        limit = int(message.get_args())
-        if limit <= 0:
-            await message.answer("❌ Лимит должен быть положительным числом.")
-            return
-        chat_limits[chat_id] = limit
-        # Обновляем maxlen для всех очередей этого чата
-        for user_id, q in messages_store[chat_id].items():
-            q.maxlen = limit
-        await message.answer(f"✅ Новый лимит сообщений на пользователя: {limit}")
-    except ValueError:
-        await message.answer("❌ Укажите число. Пример: `/set_limit 50`", parse_mode="Markdown")
+        # Запускаем проверку в отдельном потоке, чтобы не блокировать бота
+        loop = asyncio.get_running_loop()
+        matches = await loop.run_in_executor(None, tool.check, text)
 
-@dp.message(Command("summary"))
-async def cmd_summary(message: Message):
-    chat_id = message.chat.id
-    store = messages_store.get(chat_id, {})
-    if not store:
-        await message.answer("📭 Нет сообщений для анализа. Подождите, пока участники напишут что-нибудь.")
-        return
+        if not matches:
+            return "✅ Ошибок не найдено! Текст написан правильно."
 
-    processing_msg = await message.answer("⏳ Собираю данные и генерирую сводку... (может занять до 30 секунд)")
+        # Группируем ошибки по контексту (чтобы не было дублей)
+        result_parts = []
+        for i, match in enumerate(matches[:30]):  # Ограничиваем 30 ошибками на ответ
+            error_type = "🔤 Орфография" if "SPELLING" in str(match.ruleId) else "📐 Грамматика"
+            if match.replacements:
+                replacements = ", ".join(match.replacements[:5])
+                correction = f"➜ *Варианты исправления:* {replacements}"
+            else:
+                correction = ""
 
-    try:
-        summaries = []
-        for user_id, user_q in store.items():
-            # Получаем username (если есть) или используем user_id
-            user = await bot.get_chat(user_id)
-            username = user.username or f"User_{user_id}"
+            error_msg = (
+                f"{i+1}. **{error_type}**\n"
+                f"📝 Ошибка в слове: `{match.context[match.offset:match.offset+match.errorLength]}`\n"
+                f"📖 Полный контекст: {match.context.replace('`', '\\`')}\n"
+                f"{correction}"
+            )
+            result_parts.append(error_msg)
 
-            # Объединяем все сообщения пользователя
-            full_text = " ".join(user_q)
-            if not full_text.strip():
-                continue
+        # Если ошибок больше 30, добавляем предупреждение
+        if len(matches) > 30:
+            result_parts.append(f"\n... и ещё {len(matches) - 30} ошибок.")
 
-            clean_text = TextProcessor.clean_text(full_text)
-            # Извлекаем сущности
-            entities = TextProcessor.extract_named_entities(clean_text)
-
-            # Разбиваем длинный текст на части и суммаризуем каждую
-            chunks = TextProcessor.split_text(clean_text, max_tokens=500)
-            chunk_summaries = []
-            for chunk in chunks:
-                summ = await generate_summary(chunk)
-                if summ:
-                    chunk_summaries.append(summ)
-            user_summary = " ".join(chunk_summaries)
-
-            if user_summary:
-                summary_block = f"👤 *{username}*: {user_summary}"
-                if entities:
-                    summary_block += f"\n{entities}"
-                summaries.append(summary_block)
-
-        if not summaries:
-            await message.answer("⚠️ Не удалось сформировать сводку (возможно, слишком мало текста).")
-            return
-
-        # Объединяем все сводки и разбиваем на части (Telegram limit 4096)
-        full_summary = "\n\n".join(summaries)
-        for i in range(0, len(full_summary), MAX_MESSAGE_LEN):
-            await message.answer(full_summary[i:i+MAX_MESSAGE_LEN], parse_mode="Markdown")
+        return "\n\n".join(result_parts)
 
     except Exception as e:
-        logger.error(f"Ошибка в /summary: {e}", exc_info=True)
-        await message.answer("❌ Произошла ошибка при генерации сводки. Попробуйте позже.")
+        logger.error(f"Ошибка при проверке текста: {e}", exc_info=True)
+        return "❌ Произошла ошибка при проверке текста. Попробуйте ещё раз или отправьте текст меньшего объёма."
+
+# ========== ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ ==========
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает текстовые сообщения и команды"""
+    user_text = update.message.text
+
+    # Игнорируем команды (они уже обработаны выше)
+    if user_text.startswith('/'):
+        return
+
+    # Ограничиваем длину текста для проверки
+    if len(user_text) > MAX_TEXT_LENGTH:
+        await update.message.reply_text(
+            f"⚠️ Текст слишком длинный ({len(user_text)} символов).\n"
+            f"Пожалуйста, отправьте текст частями не более {MAX_TEXT_LENGTH} символов."
+        )
+        return
+
+    # Отправляем сообщение о начале проверки
+    processing_msg = await update.message.reply_text("🔍 Проверяю текст, пожалуйста, подождите...")
+
+    try:
+        # Выполняем проверку текста
+        result = await check_text(user_text)
+
+        # Отправляем результат (разбиваем на части, если он слишком длинный)
+        if len(result) > MAX_MESSAGE_LEN:
+            for i in range(0, len(result), MAX_MESSAGE_LEN):
+                await update.message.reply_text(
+                    result[i:i+MAX_MESSAGE_LEN],
+                    parse_mode="Markdown"
+                )
+        else:
+            await update.message.reply_text(result, parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"Ошибка в handle_text: {e}", exc_info=True)
+        await update.message.reply_text("❌ Произошла непредвиденная ошибка. Попробуйте ещё раз.")
     finally:
+        # Удаляем сообщение "Проверяю..."
         await processing_msg.delete()
 
-# ========== ХРАНЕНИЕ СООБЩЕНИЙ ==========
-@dp.message()
-async def store_message(message: Message):
-    # Игнорируем команды (они уже обработаны выше)
-    if message.text and message.text.startswith('/'):
-        return
-    # Игнорируем сообщения от ботов (чтобы не зацикливаться)
-    if message.from_user.is_bot:
-        return
-    # Храним только текстовые сообщения (можно расширить под фото/видео, но пока не нужно)
-    if not message.text:
-        return
+# ========== ЗАПУСК БОТА ==========
+def main():
+    """Запуск бота"""
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    chat_id = message.chat.id
-    user_id = message.from_user.id
-    limit = chat_limits[chat_id]
-    # Получаем очередь для этого чата и пользователя
-    user_queue = messages_store[chat_id][user_id]
-    # Если лимит изменился, обновляем maxlen
-    if user_queue.maxlen != limit:
-        user_queue.maxlen = limit
-    # Добавляем сообщение
-    user_queue.append(message.text)
+    # Регистрируем обработчики команд
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("about", cmd_about))
 
-    logger.debug(f"Сохранено сообщение от {user_id} в чате {chat_id}")
+    # Регистрируем обработчик inline-кнопок
+    app.add_handler(CallbackQueryHandler(handle_callback))
 
-# ========== ЗАПУСК ==========
+    # Регистрируем обработчик текстовых сообщений (кроме команд)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    logger.info("🤖 Бот для проверки орфографии запущен...")
+    app.run_polling()
+
 if __name__ == "__main__":
-    async def main():
-        await dp.start_polling(bot)
-    asyncio.run(main())
+    main()
