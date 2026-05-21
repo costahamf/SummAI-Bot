@@ -1,5 +1,2 @@
-aiogram==3.17.0
-transformers==4.46.3
-torch==2.5.1
-natasha==1.5.1
-numpy==1.26.4
+python-telegram-bot==21.10
+language-tool-python==2.8.2
